@@ -1,0 +1,810 @@
+-- Catch A Fade 2 | Premium Edition
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UIS               = game:GetService("UserInputService")
+local TweenService      = game:GetService("TweenService")
+
+local lp      = Players.LocalPlayer
+local Remotes = ReplicatedStorage:WaitForChild("Remotes", 10)
+local Combat  = Remotes and Remotes:WaitForChild("Combat", 10)
+if not Combat then warn("[CAF2 Hub] Combat remote not found"); return end
+
+local pg = lp:WaitForChild("PlayerGui")
+
+-- Robust Cleanup of all previous UI instances across PlayerGui and gethui
+local function cleanup()
+    local names = { "CAF2HubPremium", "CAF2Hub" }
+    pcall(function()
+        local h = type(gethui) == "function" and gethui()
+        if h then
+            for _, c in ipairs(h:GetChildren()) do
+                for _, name in ipairs(names) do
+                    if c.Name == name then c:Destroy() end
+                end
+            end
+        end
+    end)
+    pcall(function()
+        for _, c in ipairs(pg:GetChildren()) do
+            for _, name in ipairs(names) do
+                if c.Name == name then c:Destroy() end
+            end
+        end
+    end)
+end
+cleanup()
+
+local flags = {
+    autoSlam = false,
+    killAura = false,
+    killAuraSafe = false,
+    infStamina = false,
+    autoBlock = false,
+    autoParry = false,
+    esp = false,
+    walkSpeed = false,
+    
+    slamRange = 9,
+    killRange = 7,
+    killAuraCD = 0.4,
+    blockRange = 10,
+    parryRange = 15,
+    wsValue = 16
+}
+
+local lastSlam, lastKill, lastGuard = 0, 0, 0
+local SLAM_CD   = 2.55
+local GUARD_INTERVAL = 1.1
+local espData = {}
+
+local isCurrentlyBlocking = false
+local lastParryTime = 0
+local punchToggleState = false
+
+-- Helper functions
+local function guard() Combat:FireServer("guarding") end
+
+local function ensureGuard()
+    local myC = lp.Character
+    if myC and not myC:HasTag("guarding") then
+        Combat:FireServer("guarding")
+    end
+end
+
+local function block()
+    ensureGuard()
+    if not isCurrentlyBlocking then
+        isCurrentlyBlocking = true
+        Combat:FireServer("block")
+    end
+end
+
+local function unblock()
+    if isCurrentlyBlocking then
+        isCurrentlyBlocking = false
+        Combat:FireServer("unblock")
+    end
+end
+
+local function forceParry()
+    Combat:FireServer("unblock")
+    task.wait(0.01)
+    Combat:FireServer("block")
+    isCurrentlyBlocking = true
+    lastParryTime = tick()
+end
+
+local function validEnemy(p, char)
+    if p == lp or not char then return false end
+    if lp:FindFirstChild("Party") and p:FindFirstChild("Party")
+        and lp.Party.Value == p.Party.Value then return false end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    return hrp ~= nil and hum ~= nil and hum.Health > 0
+end
+
+local function nearest(range)
+    local myC = lp.Character
+    if not myC then return nil end
+    local myHRP = myC:FindFirstChild("HumanoidRootPart")
+    if not myHRP then return nil end
+    local best, bestD = nil, range or math.huge
+    for _, p in ipairs(Players:GetPlayers()) do
+        local c = p.Character
+        if validEnemy(p, c) then
+            local d = (myHRP.Position - c.HumanoidRootPart.Position).Magnitude
+            if d < bestD then best, bestD = c, d end
+        end
+    end
+    return best
+end
+
+-- ScreenGui for parenting ESP Highlights to avoid recreation bugs
+local sg = Instance.new("ScreenGui")
+sg.Name           = "CAF2HubPremium"
+sg.ResetOnSpawn   = false
+sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+sg.IgnoreGuiInset = true
+sg.Parent         = (type(gethui)=="function" and gethui()) or pg
+
+-- Outline ESP (Direct parenting to ScreenGui with Adornee matching)
+local function espApply(p)
+    if p == lp then return end
+    local char = p.Character
+    if not char then return end
+
+    local d = espData[p]
+    if d and d.hl and d.hl.Parent == sg and d.hl.Adornee == char then
+        return
+    end
+
+    if d then
+        pcall(function() if d.hl then d.hl:Destroy() end end)
+        espData[p] = nil
+    end
+
+    local hl = Instance.new("Highlight")
+    hl.Name = "ESPHighlight_" .. p.Name
+    hl.FillColor           = Color3.fromRGB(239, 68, 68)
+    hl.OutlineColor        = Color3.fromRGB(239, 68, 68)
+    hl.FillTransparency    = 1
+    hl.OutlineTransparency = 0
+    hl.Adornee = char
+    hl.Parent  = sg
+
+    espData[p] = { hl=hl }
+end
+
+local function espClear(p)
+    local d = espData[p]
+    if not d then return end
+    pcall(function() if d.hl then d.hl:Destroy() end end)
+    espData[p] = nil
+end
+
+-- Keep ESP updated via efficient thread loop
+task.spawn(function()
+    while task.wait(0.2) do
+        if flags.esp then
+            for _, p in ipairs(Players:GetPlayers()) do
+                if p ~= lp and p.Character then
+                    espApply(p)
+                end
+            end
+        else
+            for p in pairs(espData) do
+                espClear(p)
+            end
+        end
+    end
+end)
+
+-- Safe Mode Punch Animation
+local function playPunchAnim()
+    local char = lp.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local animator = hum and hum:FindFirstChildOfClass("Animator")
+    if animator then
+        local animsFolder = ReplicatedStorage:FindFirstChild("Animations")
+        local combatFolder = animsFolder and animsFolder:FindFirstChild("Combat")
+        local defaultFolder = combatFolder and combatFolder:FindFirstChild("Default")
+        if defaultFolder then
+            punchToggleState = not punchToggleState
+            local anim = punchToggleState and defaultFolder:FindFirstChild("L") or defaultFolder:FindFirstChild("R")
+            if anim then
+                local track = animator:LoadAnimation(anim)
+                track:Play()
+            end
+        end
+    end
+end
+
+-- Character spawn management
+local function onSpawn(char)
+    task.spawn(function()
+        task.wait(1.5)
+        guard()
+        if flags.walkSpeed then
+            local h = char:FindFirstChildOfClass("Humanoid")
+            if h then h.WalkSpeed = flags.wsValue end
+        end
+    end)
+end
+if lp.Character then onSpawn(lp.Character) end
+lp.CharacterAdded:Connect(onSpawn)
+
+-- Hook animations for Auto Parry
+local attackAnimationNames = {
+    ["l"] = true,
+    ["r"] = true,
+    ["kick"] = true,
+    ["roundkick"] = true,
+    ["head"] = true,
+    ["grab"] = true,
+    ["leftgroundpunch"] = true,
+    ["rightgroundpunch"] = true,
+    ["slam"] = true
+}
+
+local function isAttacking(char)
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    local animator = hum and hum:FindFirstChildOfClass("Animator")
+    if animator then
+        for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+            local anim = track.Animation
+            local name = anim and anim.Name
+            if name then
+                local lname = string.lower(name)
+                if attackAnimationNames[lname] or string.find(lname, "punch") or string.find(lname, "kick") or string.find(lname, "slam") then
+                    if track.IsPlaying and track.TimePosition < 0.4 then
+                        return true
+                    end
+                end
+            end
+        end
+    end
+    return false
+end
+
+local function checkIncomingAttacks()
+    local myC = lp.Character
+    if not myC then return false end
+    local myHRP = myC:FindFirstChild("HumanoidRootPart")
+    if not myHRP then return false end
+    
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= lp then
+            local c = p.Character
+            if validEnemy(p, c) then
+                local hrp = c:FindFirstChild("HumanoidRootPart")
+                if hrp then
+                    local dist = (myHRP.Position - hrp.Position).Magnitude
+                    if dist <= flags.parryRange then
+                        if isAttacking(c) then
+                            return true
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return false
+end
+
+local function monitorAnimations()
+    local function hookPlayer(p)
+        if p == lp then return end
+        local function hookChar(char)
+            local hum = char:WaitForChild("Humanoid", 10)
+            local animator = hum and hum:WaitForChild("Animator", 10)
+            if animator then
+                animator.AnimationPlayed:Connect(function(track)
+                    if not flags.autoParry then return end
+                    local anim = track.Animation
+                    local name = anim and anim.Name
+                    if name then
+                        local lname = string.lower(name)
+                        if attackAnimationNames[lname] or string.find(lname, "punch") or string.find(lname, "kick") or string.find(lname, "slam") then
+                            local myC = lp.Character
+                            local myHRP = myC and myC:FindFirstChild("HumanoidRootPart")
+                            local hrp = char:FindFirstChild("HumanoidRootPart")
+                            if myHRP and hrp then
+                                local dist = (myHRP.Position - hrp.Position).Magnitude
+                                if dist <= flags.parryRange then
+                                    forceParry()
+                                end
+                            end
+                        end
+                    end
+                end)
+            end
+        end
+        if p.Character then task.spawn(hookChar, p.Character) end
+        p.CharacterAdded:Connect(hookChar)
+    end
+    
+    for _, p in ipairs(Players:GetPlayers()) do
+        hookPlayer(p)
+    end
+    Players.PlayerAdded:Connect(hookPlayer)
+end
+
+-- Main update loop
+RunService.Heartbeat:Connect(function()
+    local now = tick()
+    local myC = lp.Character
+    if not myC then return end
+    local myHRP = myC:FindFirstChild("HumanoidRootPart")
+    if not myHRP then return end
+    local myHum = myC:FindFirstChildOfClass("Humanoid")
+
+    -- Inf Stamina
+    if (flags.infStamina or flags.autoSlam) and now - lastGuard > GUARD_INTERVAL then
+        lastGuard = now
+        guard()
+    end
+
+    -- WalkSpeed Bypass
+    if flags.walkSpeed and myHum and myHum.WalkSpeed ~= flags.wsValue then
+        myHum.WalkSpeed = flags.wsValue
+    end
+
+    -- Auto Slam
+    if flags.autoSlam and now - lastSlam >= SLAM_CD then
+        if not myC:HasTag("slamming") and not myC:HasTag("slammed") then
+            local t = nearest(flags.slamRange)
+            if t and not t:HasTag("slammed") then
+                lastSlam = now
+                Combat:FireServer("slam", t)
+            end
+        end
+    end
+
+    -- Kill Aura (Unblocks automatically to bypass server-side block check, then re-blocks)
+    if flags.killAura and now - lastKill >= flags.killAuraCD then
+        local t = nearest(flags.killRange)
+        if t then
+            lastKill = now
+            task.spawn(function()
+                local wasBlocking = isCurrentlyBlocking
+                if wasBlocking then
+                    Combat:FireServer("unblock")
+                    task.wait(0.015)
+                end
+
+                Combat:FireServer("fist")
+                Combat:FireServer("body", t, false)
+
+                if flags.killAuraSafe then
+                    playPunchAnim()
+                end
+
+                if wasBlocking then
+                    task.wait(0.015)
+                    Combat:FireServer("block")
+                end
+            end)
+        end
+    end
+
+    -- Auto Parry execution
+    if flags.autoParry then
+        if checkIncomingAttacks() then
+            if now - lastParryTime > 0.4 then
+                forceParry()
+            end
+        end
+    end
+
+    -- Auto Block execution
+    if flags.autoBlock then
+        local enemy = nearest(flags.blockRange)
+        if enemy then
+            block()
+        else
+            if not flags.autoParry or (now - lastParryTime > 0.4) then
+                unblock()
+            end
+        end
+    else
+        if not flags.autoParry or (now - lastParryTime > 0.4) then
+            unblock()
+        end
+    end
+end)
+
+Players.PlayerRemoving:Connect(espClear)
+monitorAnimations()
+
+-- =============================================================================
+-- PREMIUM GUI CREATION
+-- =============================================================================
+
+local main = Instance.new("Frame", sg)
+main.Name             = "Main"
+main.Size             = UDim2.new(0, 480, 0, 320)
+main.Position         = UDim2.new(0.5, -240, 0.5, -160)
+main.BackgroundColor3 = Color3.fromRGB(15, 15, 18)
+main.BorderSizePixel  = 0
+main.ClipsDescendants = true
+
+local mainCorner = Instance.new("UICorner", main)
+mainCorner.CornerRadius = UDim.new(0, 8)
+
+local mainStroke = Instance.new("UIStroke", main)
+mainStroke.Color     = Color3.fromRGB(239, 68, 68)
+mainStroke.Thickness = 1.5
+
+-- Sidebar
+local sidebar = Instance.new("Frame", main)
+sidebar.Name             = "Sidebar"
+sidebar.Size             = UDim2.new(0, 130, 1, 0)
+sidebar.BackgroundColor3 = Color3.fromRGB(21, 21, 25)
+sidebar.BorderSizePixel  = 0
+
+local sidebarSeparator = Instance.new("Frame", sidebar)
+sidebarSeparator.Size = UDim2.new(0, 1, 1, 0)
+sidebarSeparator.Position = UDim2.new(1, -1, 0, 0)
+sidebarSeparator.BackgroundColor3 = Color3.fromRGB(39, 39, 45)
+sidebarSeparator.BorderSizePixel = 0
+
+local titleBlock = Instance.new("Frame", sidebar)
+titleBlock.Size = UDim2.new(1, 0, 0, 60)
+titleBlock.BackgroundTransparency = 1
+
+local title = Instance.new("TextLabel", titleBlock)
+title.Size = UDim2.new(1, 0, 0, 20)
+title.Position = UDim2.new(0, 0, 0, 15)
+title.BackgroundTransparency = 1
+title.Font = Enum.Font.GothamBold
+title.TextColor3 = Color3.fromRGB(239, 68, 68)
+title.TextSize = 15
+title.Text = "CAF2 HUB"
+
+local subtitle = Instance.new("TextLabel", titleBlock)
+subtitle.Size = UDim2.new(1, 0, 0, 12)
+subtitle.Position = UDim2.new(0, 0, 0, 32)
+subtitle.BackgroundTransparency = 1
+subtitle.Font = Enum.Font.Gotham
+subtitle.TextColor3 = Color3.fromRGB(161, 161, 170)
+subtitle.TextSize = 9
+subtitle.Text = "premium edition"
+
+local tabContainer = Instance.new("Frame", sidebar)
+tabContainer.Size = UDim2.new(1, 0, 1, -60)
+tabContainer.Position = UDim2.new(0, 0, 0, 60)
+tabContainer.BackgroundTransparency = 1
+
+local tabLayout = Instance.new("UIListLayout", tabContainer)
+tabLayout.Padding = UDim.new(0, 4)
+tabLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+
+local tabPad = Instance.new("UIPadding", tabContainer)
+tabPad.PaddingLeft = UDim.new(0, 8)
+tabPad.PaddingRight = UDim.new(0, 8)
+
+-- Content Area
+local contentArea = Instance.new("Frame", main)
+contentArea.Name = "ContentArea"
+contentArea.Size = UDim2.new(1, -130, 1, 0)
+contentArea.Position = UDim2.new(0, 130, 0, 0)
+contentArea.BackgroundTransparency = 1
+
+local tabFrames = {}
+local tabButtons = {}
+
+local function createTabFrame(name)
+    local scroll = Instance.new("ScrollingFrame")
+    scroll.Size = UDim2.new(1, 0, 1, 0)
+    scroll.BackgroundTransparency = 1
+    scroll.BorderSizePixel = 0
+    scroll.ScrollBarThickness = 3
+    scroll.ScrollBarImageColor3 = Color3.fromRGB(239, 68, 68)
+    scroll.Visible = false
+    scroll.Parent = contentArea
+    
+    local layout = Instance.new("UIListLayout", scroll)
+    layout.Padding = UDim.new(0, 6)
+    layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    
+    local pad = Instance.new("UIPadding", scroll)
+    pad.PaddingTop = UDim.new(0, 12)
+    pad.PaddingLeft = UDim.new(0, 12)
+    pad.PaddingRight = UDim.new(0, 12)
+    pad.PaddingBottom = UDim.new(0, 12)
+    
+    layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+        scroll.CanvasSize = UDim2.new(0, 0, 0, layout.AbsoluteContentSize.Y + 24)
+    end)
+    
+    tabFrames[name] = scroll
+    return scroll
+end
+
+local function showTab(name)
+    for tName, frame in pairs(tabFrames) do
+        frame.Visible = (tName == name)
+    end
+    for tName, btn in pairs(tabButtons) do
+        local isSelected = (tName == name)
+        btn.TextColor3 = isSelected and Color3.fromRGB(239, 68, 68) or Color3.fromRGB(161, 161, 170)
+        local stroke = btn:FindFirstChild("UIStroke")
+        if stroke then
+            stroke.Color = isSelected and Color3.fromRGB(239, 68, 68) or Color3.fromRGB(39, 39, 42)
+            stroke.Thickness = isSelected and 1.2 or 1
+        end
+    end
+end
+
+local function createTabButton(name)
+    local btn = Instance.new("TextButton", tabContainer)
+    btn.Size = UDim2.new(1, 0, 0, 32)
+    btn.BackgroundColor3 = Color3.fromRGB(22, 22, 27)
+    btn.BorderSizePixel = 0
+    btn.Font = Enum.Font.GothamBold
+    btn.TextColor3 = Color3.fromRGB(161, 161, 170)
+    btn.TextSize = 11
+    btn.Text = name
+    
+    local btnCorner = Instance.new("UICorner", btn)
+    btnCorner.CornerRadius = UDim.new(0, 5)
+    
+    local btnStroke = Instance.new("UIStroke", btn)
+    btnStroke.Color = Color3.fromRGB(39, 39, 42)
+    btnStroke.Thickness = 1
+    
+    btn.MouseButton1Click:Connect(function()
+        showTab(name)
+    end)
+    
+    tabButtons[name] = btn
+    return btn
+end
+
+local function createToggle(parent, text, defaultVal, callback)
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1, 0, 0, 38)
+    row.BackgroundColor3 = Color3.fromRGB(22, 22, 27)
+    row.BorderSizePixel = 0
+    row.Parent = parent
+    
+    local corner = Instance.new("UICorner", row)
+    corner.CornerRadius = UDim.new(0, 6)
+    
+    local stroke = Instance.new("UIStroke", row)
+    stroke.Color = Color3.fromRGB(39, 39, 45)
+    stroke.Thickness = 1
+    
+    local label = Instance.new("TextLabel", row)
+    label.Size = UDim2.new(1, -60, 1, 0)
+    label.Position = UDim2.new(0, 12, 0, 0)
+    label.BackgroundTransparency = 1
+    label.Font = Enum.Font.Gotham
+    label.TextColor3 = Color3.fromRGB(244, 244, 245)
+    label.TextSize = 12
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Text = text
+    
+    local pill = Instance.new("Frame", row)
+    pill.Size = UDim2.new(0, 34, 0, 18)
+    pill.Position = UDim2.new(1, -46, 0.5, -9)
+    pill.BackgroundColor3 = defaultVal and Color3.fromRGB(239, 68, 68) or Color3.fromRGB(45, 45, 55)
+    pill.BorderSizePixel = 0
+    
+    local pillCorner = Instance.new("UICorner", pill)
+    pillCorner.CornerRadius = UDim.new(1, 0)
+    
+    local knob = Instance.new("Frame", pill)
+    knob.Size = UDim2.new(0, 14, 0, 14)
+    knob.Position = defaultVal and UDim2.new(0, 18, 0.5, -7) or UDim2.new(0, 2, 0.5, -7)
+    knob.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    knob.BorderSizePixel = 0
+    
+    local knobCorner = Instance.new("UICorner", knob)
+    knobCorner.CornerRadius = UDim.new(1, 0)
+    
+    local btn = Instance.new("TextButton", row)
+    btn.Size = UDim2.new(1, 0, 1, 0)
+    btn.BackgroundTransparency = 1
+    btn.Text = ""
+    
+    local enabled = defaultVal
+    btn.MouseButton1Click:Connect(function()
+        enabled = not enabled
+        TweenService:Create(pill, TweenInfo.new(0.15), {
+            BackgroundColor3 = enabled and Color3.fromRGB(239, 68, 68) or Color3.fromRGB(45, 45, 55)
+        }):Play()
+        TweenService:Create(knob, TweenInfo.new(0.15), {
+            Position = enabled and UDim2.new(0, 18, 0.5, -7) or UDim2.new(0, 2, 0.5, -7)
+        }):Play()
+        callback(enabled)
+    end)
+    
+    return function(val)
+        enabled = val
+        pill.BackgroundColor3 = enabled and Color3.fromRGB(239, 68, 68) or Color3.fromRGB(45, 45, 55)
+        knob.Position = enabled and UDim2.new(0, 18, 0.5, -7) or UDim2.new(0, 2, 0.5, -7)
+        callback(enabled)
+    end
+end
+
+local function createSlider(parent, text, minV, maxV, defaultVal, callback)
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1, 0, 0, 50)
+    row.BackgroundColor3 = Color3.fromRGB(22, 22, 27)
+    row.BorderSizePixel = 0
+    row.Parent = parent
+    
+    local corner = Instance.new("UICorner", row)
+    corner.CornerRadius = UDim.new(0, 6)
+    
+    local stroke = Instance.new("UIStroke", row)
+    stroke.Color = Color3.fromRGB(39, 39, 45)
+    stroke.Thickness = 1
+    
+    local label = Instance.new("TextLabel", row)
+    label.Size = UDim2.new(1, -24, 0, 24)
+    label.Position = UDim2.new(0, 12, 0, 2)
+    label.BackgroundTransparency = 1
+    label.Font = Enum.Font.Gotham
+    label.TextColor3 = Color3.fromRGB(244, 244, 245)
+    label.TextSize = 11
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Text = text .. "  [" .. defaultVal .. "]"
+    
+    local track = Instance.new("Frame", row)
+    track.Size = UDim2.new(1, -24, 0, 4)
+    track.Position = UDim2.new(0, 12, 0, 34)
+    track.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
+    track.BorderSizePixel = 0
+    
+    local trackCorner = Instance.new("UICorner", track)
+    trackCorner.CornerRadius = UDim.new(1, 0)
+    
+    local fill = Instance.new("Frame", track)
+    fill.Size = UDim2.new((defaultVal - minV) / (maxV - minV), 0, 1, 0)
+    fill.BackgroundColor3 = Color3.fromRGB(239, 68, 68)
+    fill.BorderSizePixel = 0
+    
+    local fillCorner = Instance.new("UICorner", fill)
+    fillCorner.CornerRadius = UDim.new(1, 0)
+    
+    local knob = Instance.new("Frame", track)
+    knob.Size = UDim2.new(0, 12, 0, 12)
+    knob.Position = UDim2.new((defaultVal - minV) / (maxV - minV), -6, 0.5, -6)
+    knob.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    knob.BorderSizePixel = 0
+    
+    local knobCorner = Instance.new("UICorner", knob)
+    knobCorner.CornerRadius = UDim.new(1, 0)
+    
+    local hitbox = Instance.new("TextButton", track)
+    hitbox.Size = UDim2.new(1, 0, 0, 20)
+    hitbox.Position = UDim2.new(0, 0, 0.5, -10)
+    hitbox.BackgroundTransparency = 1
+    hitbox.Text = ""
+    
+    local sliding = false
+    local function update(x)
+        local pct = math.clamp((x - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
+        local val = math.floor(minV + pct * (maxV - minV))
+        fill.Size = UDim2.new(pct, 0, 1, 0)
+        knob.Position = UDim2.new(pct, -6, 0.5, -6)
+        label.Text = text .. "  [" .. val .. "]"
+        callback(val)
+    end
+    
+    hitbox.MouseButton1Down:Connect(function() sliding = true end)
+    UIS.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then sliding = false end
+    end)
+    UIS.InputChanged:Connect(function(input)
+        if sliding and input.UserInputType == Enum.UserInputType.MouseMovement then
+            update(input.Position.X)
+        end
+    end)
+end
+
+-- Tabs
+local combatTab = createTabFrame("Combat")
+local visualsTab = createTabFrame("Visuals")
+local movementTab = createTabFrame("Movement")
+
+createTabButton("Combat")
+createTabButton("Visuals")
+createTabButton("Movement")
+
+showTab("Combat")
+
+-- Combat features
+createToggle(combatTab, "Auto Slam", false, function(v)
+    flags.autoSlam = v
+end)
+
+createSlider(combatTab, "Slam Range", 5, 30, 9, function(v)
+    flags.slamRange = v
+end)
+
+createToggle(combatTab, "Kill Aura", false, function(v)
+    flags.killAura = v
+end)
+
+createToggle(combatTab, "Kill Aura Safe Mode", false, function(v)
+    flags.killAuraSafe = v
+end)
+
+createSlider(combatTab, "Kill Speed (CD in ms)", 100, 1000, 400, function(v)
+    flags.killAuraCD = v / 1000
+end)
+
+createSlider(combatTab, "Kill Range", 5, 30, 7, function(v)
+    flags.killRange = v
+end)
+
+createToggle(combatTab, "Inf. Stamina", false, function(v)
+    flags.infStamina = v
+    if v and lp.Character then guard() end
+end)
+
+createToggle(combatTab, "Auto Block", false, function(v)
+    flags.autoBlock = v
+end)
+
+createSlider(combatTab, "Block Range", 5, 30, 10, function(v)
+    flags.blockRange = v
+end)
+
+createToggle(combatTab, "Auto Parry", false, function(v)
+    flags.autoParry = v
+end)
+
+createSlider(combatTab, "Parry Range", 5, 30, 15, function(v)
+    flags.parryRange = v
+end)
+
+-- Visual features
+createToggle(visualsTab, "Player ESP (Outlines)", false, function(v)
+    flags.esp = v
+end)
+
+-- Movement features
+createToggle(movementTab, "Walk Speed", false, function(v)
+    flags.walkSpeed = v
+    if not v then
+        local c = lp.Character
+        if c then
+            local h = c:FindFirstChildOfClass("Humanoid")
+            if h then h.WalkSpeed = 16 end
+        end
+    end
+end)
+
+createSlider(movementTab, "Speed Value", 16, 120, 16, function(v)
+    flags.wsValue = v
+    if flags.walkSpeed then
+        local c = lp.Character
+        if c then
+            local h = c:FindFirstChildOfClass("Humanoid")
+            if h then h.WalkSpeed = flags.wsValue end
+        end
+    end
+end)
+
+-- Window dragging logic
+local dragStart, startPos
+local dragging = false
+sidebar.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        dragging = true
+        dragStart = input.Position
+        startPos = main.Position
+    end
+end)
+UIS.InputChanged:Connect(function(input)
+    if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
+        local delta = input.Position - dragStart
+        main.Position = UDim2.new(
+            startPos.X.Scale, startPos.X.Offset + delta.X,
+            startPos.Y.Scale, startPos.Y.Offset + delta.Y
+        )
+    end
+end)
+UIS.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        dragging = false
+    end
+end)
+
+-- Toggle keybind (Right Shift)
+local guiVisible = true
+UIS.InputBegan:Connect(function(input, gpe)
+    if gpe then return end
+    if input.KeyCode == Enum.KeyCode.RightShift then
+        guiVisible = not guiVisible
+        main.Visible = guiVisible
+    end
+end)
+
+print("[CAF2 Hub Premium] Reloaded and cleaned up duplicate UI instances")
